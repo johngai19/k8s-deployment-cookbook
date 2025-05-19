@@ -1,27 +1,36 @@
-# kubectl-helm Docker Image & Kubernetes Deployment
+# kubectl-helm Docker Image & OSS‐backed Chart Loader
 
-This repo contains a Dockerfile to build a small Alpine-based image with `kubectl` and Helm installed, plus a single K8s manifest (`deploy/kubectl-helm-deploy.yaml`) to deploy it with the necessary RBAC permissions.
+This repo contains a Dockerfile to build a small Alpine-based image with `kubectl`, Helm, and MinIO client (`mc`) installed, plus Kubernetes manifests to deploy it with the necessary RBAC permissions and OSS support.
 
 ## Prerequisites
 
 - Docker (or [Minikube](https://minikube.sigs.k8s.io/docs/) for local testing)
 - `kubectl` CLI configured to talk to your cluster
 - Helm CLI
+- MinIO client (`mc`)
 - (Optional) `minikube` for local Kubernetes
+
+## New: external `/charts` volume + OSS support
+
+We added:
+- MinIO client (`mc`) for S3/MinIO.
+- A Docker `VOLUME ["/charts"]` so you can mount chart-tgzs.
+- Kubernetes `Secret` + env vars to configure your OSS credentials.
 
 ## Build & Load the Image
 
 ### Standard Docker build
 
-```sh
+```bash
 docker build -t your-registry/kubectl-helm:latest .
 docker push your-registry/kubectl-helm:latest
 ```
+
 ### Minikube build
 
 If you are using Minikube, you can build the image directly into the Minikube VM:
 
-```sh
+```bash
 minikube start
 eval $(minikube docker-env)
 docker build -t kubectl-helm:latest .
@@ -29,41 +38,76 @@ docker build -t kubectl-helm:latest .
 
 Or you can use the `--load` option to load the image into Minikube:
 
-```sh
+```bash
 docker build -t kubectl-helm:latest .
 minikube image load kubectl-helm:latest
 ```
+
 ## Deploy the Image
-Apply the combined RBAC and deployment manifest:
 
-```sh
-kubectl apply -f deploy/kubectl-helm-deploy.yaml
+### 1) Create your OSS & MySQL secrets
+
+```bash
+# S3 / MinIO credentials
+kubectl create secret generic s3-credentials \
+  --from-literal=accesskey=YOUR_ACCESS_KEY \
+  --from-literal=secretkey=YOUR_SECRET_KEY
+
+# MySQL credentials (matches your mysql-deployment.yaml)
+kubectl create secret generic mysql-credentials \
+  --from-literal=username=dbuser \
+  --from-literal=password=mysqlpass \
+  --from-literal=database=mydb
 ```
-This will create a `kubectl-helm` deployment with the necessary RBAC permissions to run `kubectl` and `helm` commands. The deployment will use the image built in the previous step.
 
-- A service account named `kubectl-helm` will be created.
-- A cluster role named `kubectl-helm` will be created with the necessary permissions to run `kubectl` and `helm` commands.
-- A cluster role binding named `kubectl-helm` will be created to bind the service account to the cluster role.  
-- A deployment named `kubectl-helm` will be created with the image built in the previous step.
+### 2) Deploy with OSS + chart‐mount + MySQL
+
+```bash
+kubectl apply -f deploy/k8s-cluster-permissions.yaml
+# OR for namespace-scoped RBAC
+kubectl apply -f deploy/k8s-deployment.yaml
+```
+
+This will create a `kubectl-helm` deployment with the necessary RBAC permissions to run `kubectl`, `helm`, and `mc` commands. The deployment will use the image built in the previous step.
+
+- A service account named `kubectl-helm-admin` will be created.
+- A cluster role named `kubectl-helm-cluster-role` will be created with the necessary permissions to run `kubectl`, `helm`, and `mc` commands.
+- A cluster role binding named `kubectl-helm-cluster-rolebinding` will be created to bind the service account to the cluster role.  
+- A deployment named `kubectl-helm-deployment` will be created with the image built in the previous step.
 
 ## Verify the Deployment
 
 ### Check resources
 To check the resources created, run:
 
-```sh  
+```bash  
 kubectl get sa,cr,crb,deploy -n default
 ```
 
 ### Get the pod name and shell in
 
-```sh
+```bash
 POD=$(kubectl get pods -l app=kubectl-helm -o jsonpath='{.items[0].metadata.name}')
 kubectl exec -it $POD -- bash
 ```
-### inside the pod you can run
 
-```sh
+### Load a chart into `/charts`
+
+```bash
+POD=$(kubectl get pod -l app=kubectl-helm -o jsonpath='{.items[0].metadata.name}')
+# configure mc
+kubectl exec -it $POD -- mc alias set s3 $MC_HOST_s3 $MC_ACCESS_KEY $MC_SECRET_KEY
+# copy chart from bucket
+kubectl exec -it $POD -- mc cp s3/my-bucket/mychart-1.2.3.tgz /charts/
+# install locally
+kubectl exec -it $POD -- helm install mychart /charts/mychart-1.2.3.tgz -n default
+```
+
+_No PVs needed – charts live in an `emptyDir`._
+
+### Inside the pod you can run
+
+```bash
 # K8s operations
 kubectl get pods,services,deployments
 kubectl create namespace test-namespace
@@ -75,123 +119,44 @@ helm list -A
 helm upgrade my-nginx bitnami/nginx -n test-namespace
 helm uninstall my-nginx -n test-namespace
 ```
-## Testing on  Minikube
+
+## Testing on Minikube
+
 ### Create a test namespace
-```sh
+
+```bash
 kubectl create namespace test-namespace
 ```
+
 ### Deploy and verify the deployment
-```sh
-kubectl apply -f deploy/kubectl-helm-deploy.yaml
+
+```bash
+kubectl apply -f deploy/k8s-deployment.yaml
 ```
+
 ### Check the deployment
-```sh
+
+```bash
 kubectl get pods,services,deployments -n test-namespace
 ```
-use `minikube dashboard` to check the deployment in the dashboard
-forward ports if necessary
-```sh   
+
+Use `minikube dashboard` to check the deployment in the dashboard. Forward ports if necessary:
+
+```bash   
 kubectl port-forward -n test-namespace svc/kubectl-helm 8080:80
 ```
+
 ## Permission scope
+
 - Cluster-wide: The provided ClusterRole allows full control over namespaces and all core & custom resources.
 - Least-privilege: In production, tailor rules to only the resources & verbs you need.
 
-```yaml
-
-```yaml
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: kubectl-helm-admin
-  namespace: default
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: kubectl-helm-cluster-role
-rules:
-- apiGroups: [""]
-  resources:
-    - namespaces
-    - pods
-    - services
-    - configmaps
-    - secrets
-    - persistentvolumes
-    - persistentvolumeclaims
-  verbs: ["*"]
-- apiGroups: ["apps"]
-  resources:
-    - deployments
-    - replicasets
-    - statefulsets
-    - daemonsets
-  verbs: ["*"]
-- apiGroups: ["batch"]
-  resources:
-    - jobs
-    - cronjobs
-  verbs: ["*"]
-- apiGroups: ["networking.k8s.io"]
-  resources:
-    - ingresses
-  verbs: ["*"]
-- apiGroups: ["rbac.authorization.k8s.io"]
-  resources:
-    - roles
-    - rolebindings
-    - clusterroles
-    - clusterrolebindings
-  verbs: ["*"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: kubectl-helm-cluster-rolebinding
-subjects:
-- kind: ServiceAccount
-  name: kubectl-helm-admin
-  namespace: default
-roleRef:
-  kind: ClusterRole
-  name: kubectl-helm-cluster-role
-  apiGroup: rbac.authorization.k8s.io
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: kubectl-helm-deployment
-  namespace: default
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: kubectl-helm
-  template:
-    metadata:
-      labels:
-        app: kubectl-helm
-    spec:
-      serviceAccountName: kubectl-helm-admin
-      containers:
-      - name: kubectl-helm
-        image: your-registry/kubectl-helm:latest
-        imagePullPolicy: Always
-        command: ["bash", "-c", "sleep infinity"]
-        resources:
-          limits:
-            cpu: "0.5"
-            memory: "512Mi"
-          requests:
-            cpu: "0.2"
-            memory: "256Mi"
-```
-
 ## Cleanup
+
 To delete the deployment and all associated resources, run:
 
-```sh
-kubectl delete -f deploy/kubectl-helm-deploy.yaml
+```bash
+kubectl delete -f deploy/k8s-deployment.yaml
 ```
+
 This will remove the deployment, service account, cluster role, and cluster role binding.

@@ -1,3 +1,37 @@
+# ───────────────────────────────────────────────────────────────
+# BEFORE you apply this manifest you must create two secrets:
+#
+#   kubectl create secret generic s3-credentials \
+#     --from-literal=accesskey=YOUR_ACCESS_KEY \
+#     --from-literal=secretkey=YOUR_SECRET_KEY
+#
+#   kubectl create secret generic mysql-credentials \
+#     --from-literal=username=dbuser \
+#     --from-literal=password=mysqlpass \
+#     --from-literal=database=mydb
+# ───────────────────────────────────────────────────────────────
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: s3-credentials
+  namespace: default
+type: Opaque
+data:
+  accesskey: <base64-your-access-key>
+  secretkey: <base64-your-secret-key>
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-credentials
+  namespace: default
+type: Opaque
+data:
+  username: <base64-dbuser>
+  password: <base64-mysqlpass>
+  database: <base64-mydb>
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -55,13 +89,48 @@ spec:
       serviceAccountName: kubectl-helm-admin
       containers:
       - name: kubectl-helm
-        image: your-registry/kubectl-helm:latest  # Replace with your actual image name/tag
-        imagePullPolicy: Always
-        command: ["bash", "-c", "sleep infinity"]  # Keep container running
+        image: your-registry/kubectl-helm:latest
+        command: ["bash", "-c", "sleep infinity"]
+        env:
+        - name: MC_HOST_s3
+          value: "https://<your-s3-endpoint>"
+        - name: MC_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: s3-credentials
+              key: accesskey
+        - name: MC_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: s3-credentials
+              key: secretkey
+        - name: MYSQL_HOST
+          value: "mysql.default.svc.cluster.local"
+        - name: MYSQL_USER
+          valueFrom:
+            secretKeyRef:
+              name: mysql-credentials
+              key: username
+        - name: MYSQL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-credentials
+              key: password
+        - name: MYSQL_DATABASE
+          valueFrom:
+            secretKeyRef:
+              name: mysql-credentials
+              key: database
         resources:
-          limits:
-            cpu: "0.5"
-            memory: "512Mi"
           requests:
-            cpu: "0.2"
-            memory: "256Mi"
+            memory: "64Mi"
+            cpu: "100m"
+          limits:
+            memory: "128Mi"
+            cpu: "200m"
+        volumeMounts:
+        - name: charts
+          mountPath: /charts
+      volumes:
+      - name: charts
+        emptyDir: {}
